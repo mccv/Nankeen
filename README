@@ -1,0 +1,7 @@
+A simple long term load testing driver for Kestrel
+Depends on my Jackhammer fork with org corrected and SBT version bumped, http://github.com/mccv/jackhammer
+
+Usage
+
+go to the sbt console
+run-load <queue prefix> <num loops> <num queues> <readers> <writers> <num messages> 
