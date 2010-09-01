@@ -11,14 +11,19 @@ import net.lag.smile._
 import scala.collection.mutable._
 import java.util.concurrent.TimeUnit
 
-class Reader(client: MemcacheClient[String], queueName: String, numMessages: Int, expectedMessages: Set[String], useGrabbyHands:Boolean, grabbyHands:GrabbyHands) extends Runnable{
+trait Reader extends Runnable{
   val log = Logger.get("nankeen")
+  val expectedMessages: Set[String]
+  def sleepTime = Some(10)
+  val queueName: String
 
-  def run() = {
+  def get(): Unit
+
+  def run(): Unit = {
     try {
       while (expectedMessages.size > 0) {
         get()
-        if (!useGrabbyHands) Thread.sleep(10)
+        sleepTime.foreach(Thread.sleep(_))
       }
     } catch {
       case e => {
@@ -27,32 +32,38 @@ class Reader(client: MemcacheClient[String], queueName: String, numMessages: Int
       }
     }
   }
+}
 
+class SmileReader(client: MemcacheClient[String], val queueName: String, val expectedMessages: Set[String]) extends Reader{
   def get() = {
-    if( useGrabbyHands ) {
-      val value = grabbyHands.getRecvQueue(queueName).poll(10, TimeUnit.SECONDS)
-      if ( value != null ) {
-        val msg = new String(value.array)
+    client.get(queueName) match {
+      case Some(msg) => {
         expectedMessages.synchronized {
           expectedMessages - msg
         }
       }
-    } else {
-      client.get(queueName) match {
-        case Some(msg) => {
-          expectedMessages.synchronized {
-            expectedMessages - msg
-          }
-        }
-        case None => //noop
+      case None => //noop
+    }
+  }
+}
+
+class GrabbyReader(grabbyHands: GrabbyHands, val queueName: String, val expectedMessages: Set[String]) extends Reader{
+  val sleeepTime = None
+  def get() = {
+    val value = grabbyHands.getRecvQueue(queueName).poll(10, TimeUnit.SECONDS)
+    if ( value != null ) {
+      val msg = new String(value.array)
+      expectedMessages.synchronized {
+        expectedMessages - msg
       }
     }
   }
 }
 
-class Writer(client: MemcacheClient[String], queueName: String, numMessages: Int, messages: LinkedBlockingQueue[String], useGrabbyHands:Boolean, grabbyHands:GrabbyHands) extends Runnable{
+trait Writer extends Runnable {
   val log = Logger.get("nankeen")
-
+  val queueName: String
+  val messages: LinkedBlockingQueue[String]
   def run(): Unit = {
     try {
       while (true) {
@@ -73,40 +84,22 @@ class Writer(client: MemcacheClient[String], queueName: String, numMessages: Int
     }
   }
 
+  def put(data: String)
+}
+
+class SmileWriter(client: MemcacheClient[String], val queueName: String, val messages: LinkedBlockingQueue[String]) extends Writer{
   def put(data: String) = {
-    if ( useGrabbyHands ) {
-      val write = new Write(data)
-      grabbyHands.getSendQueue(queueName).put(write)
-    } else {
-      client.set(queueName, data)
-    }
+    client.set(queueName, data)
+  }
+}
+class GrabbyWriter(grabbyHands:GrabbyHands, val queueName: String, val messages: LinkedBlockingQueue[String]) extends Writer{
+  def put(data: String) = {
+    val write = new Write(data)
+    grabbyHands.getSendQueue(queueName).put(write)
   }
 }
 
-class Loader(servers: Array[String], queueName: String, numWriters: Int,
-             numReaders: Int, numMessages: Int, useGrabbyHands:Boolean, grabbyHands:GrabbyHands) extends Runnable{
-
-  val distribution = "ketama"
-  val hash = "fnv1a-64"
-
-  val messagesSet = Set((1 to numMessages).map(i => Nankeen.messagePrefix + i):_*)
-
-  val messagesQueue = new LinkedBlockingQueue[String](messagesSet.size)
-  messagesSet.foreach(messagesQueue.offer(_))
-
-  val locator = NodeLocator.byName(distribution) match {
-    case (hashName, factory) =>
-      factory(KeyHasher.byName(hash))
-  }
-  val client = new MemcacheClient(locator, MemcacheCodec.UTF8)
-  val pool = new ServerPool
-  val connections = for (s <- servers) yield ServerPool.makeConnection(s, pool)
-  pool.servers = connections
-  client.setPool(pool)
-
-  val readers = (1 to numReaders).map(i => new Reader(client, queueName, numMessages, messagesSet, useGrabbyHands, grabbyHands)).toList
-  val writers = (1 to numWriters).map(i => new Writer(client, queueName, numMessages, messagesQueue, useGrabbyHands, grabbyHands)).toList
-
+class Loader(readers: List[Reader], writers: List[Writer]) extends Runnable {
   def run() = {
     val readerThreads = readers.map(r => new Thread(r))
     val writerThreads = writers.map(r => new Thread(r))
@@ -114,9 +107,6 @@ class Loader(servers: Array[String], queueName: String, numWriters: Int,
     writerThreads.foreach(_.start)
     readerThreads.foreach(_.join)
     writerThreads.foreach(_.join)
-    if(!useGrabbyHands) {
-      client.shutdown()
-    }
   }
 }
 
@@ -148,31 +138,64 @@ object Nankeen extends LoggingLoadTest {
       useGrabbyHands = args(7).toBoolean
     }
 
-
-
     val timingsFile = new File("timings.log")
     log.info("Using %d writers and %d readers to write %d messages to %d queues prefaced by %s".
                     format(numWriters, numReaders, numMessages, numQueues, queueName))
     val queues = (1 to numQueues).toList
 
-    val grabbyHands:GrabbyHands = {
-    if( false ) {
-      val grabbyConfig = new GrabbyConfig
-      grabbyConfig.addServers(Array(hostName))
-      grabbyConfig.addQueues(queues.map { i => queueName+i } )
-      new GrabbyHands(grabbyConfig)
-    } else {
-      null
+    val grabbyHands = {
+      if (useGrabbyHands) {
+        val grabbyConfig = new GrabbyConfig
+        grabbyConfig.addServers(Array(hostName))
+        grabbyConfig.addQueues(queues.map {i => queueName + i} )
+        Some(new GrabbyHands(grabbyConfig))
+      } else {
+        None
+      }
     }
-  }
+
+    // only need to start up a memcache client if we aren't using grabby hands
+    val memcacheClient = grabbyHands match  {
+      case None => {
+        val distribution = "ketama"
+        val hash = "fnv1a-64"
+        val locator = NodeLocator.byName(distribution) match {
+          case (hashName, factory) =>
+            factory(KeyHasher.byName(hash))
+        }
+        val client = new MemcacheClient(locator, MemcacheCodec.UTF8)
+        val pool = new ServerPool
+        val connections = Array(ServerPool.makeConnection(hostName, pool))
+        pool.servers = connections
+        client.setPool(pool)
+        Some(client)
+      }
+      case _ => None
+    }
 
     while(loops > 0) {
+      log.debug("running loop %d", loops)
       loops -= 1
-      val loaderThreads = queues.map {i =>
-        //Console.println(" queue " + i + " loop" + loops)
-        val loader = new Loader(Array(hostName), queueName + i, numWriters, numReaders, numMessages, useGrabbyHands, grabbyHands)
+      val messagesSet = Set((1 to numMessages).map(i => Nankeen.messagePrefix + i):_*)
+      val messagesQueue = new LinkedBlockingQueue[String](messagesSet.size)
+      messagesSet.foreach(messagesQueue.offer(_))
+
+      val loaderThreads = queues.map (i => {
+        val (readers, writers) = grabbyHands match {
+          case Some(grabby) => {
+            val readers = (1 to numReaders).map(i => new GrabbyReader(grabby, queueName + i, messagesSet)).toList
+            val writers = (1 to numWriters).map(i => new GrabbyWriter(grabby, queueName + i, messagesQueue)).toList
+            (readers, writers)
+          }
+          case None => {
+            val readers = (1 to numReaders).map(i => new SmileReader(memcacheClient.get, queueName + i, messagesSet)).toList
+            val writers = (1 to numWriters).map(i => new SmileWriter(memcacheClient.get, queueName + i, messagesQueue)).toList
+            (readers, writers)
+          }
+        }
+        val loader = new Loader(readers, writers)
         new Thread(loader)
-      }
+      })
       runWithTiming {
         loaderThreads.foreach(_.start)
         loaderThreads.foreach(_.join)
@@ -180,9 +203,8 @@ object Nankeen extends LoggingLoadTest {
         dumpLogOutput(timingsFile)
       }
     }
-    //gh1.1 grabbyHands.close
-    //Grabby hands uses daemon threads
-    System.exit(1)
+    log.info("finished runs, exiting")
+    memcacheClient.foreach(_.shutdown())
+    grabbyHands.foreach(_.halt())
   }
-
 }
