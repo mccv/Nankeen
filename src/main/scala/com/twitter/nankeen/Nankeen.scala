@@ -23,7 +23,6 @@ trait Reader extends Runnable{
     try {
       while (expectedMessages.size > 0) {
         get()
-        sleepTime.foreach(Thread.sleep(_))
       }
     } catch {
       case e => {
@@ -44,18 +43,33 @@ class SmileReader(client: MemcacheClient[String], val queueName: String, val exp
       }
       case None => //noop
     }
+    sleepTime.foreach(Thread.sleep(_))
   }
 }
 
 class GrabbyReader(grabbyHands: GrabbyHands, val queueName: String, val expectedMessages: Set[String]) extends Reader{
   val sleeepTime = None
   def get() = {
-    val value = grabbyHands.getRecvQueue(queueName).poll(10, TimeUnit.SECONDS)
+    val value = grabbyHands.getRecvQueue(queueName).poll(sleepTime, TimeUnit.SECONDS)
     if ( value != null ) {
       val msg = new String(value.array)
       expectedMessages.synchronized {
         expectedMessages - msg
       }
+    }
+  }
+}
+
+class GrabbyTransactionalReader(grabbyHands: GrabbyHands, val queueName: String, val expectedMessages: Set[String]) extends Reader{
+  val sleeepTime = None
+  def get() = {
+    val value = grabbyHands.getRecvTransQueue(queueName).poll(sleepTime, TimeUnit.SECONDS)
+    if ( value != null ) {
+      val msg = new String(value.message.array)
+      expectedMessages.synchronized {
+        expectedMessages - msg
+      }
+	  value.close
     }
   }
 }
@@ -114,13 +128,14 @@ object Nankeen extends LoggingLoadTest {
   val messagePrefix = "Nankeen Load Test Message "
   val log = Logger.get("nankeen")
   def main(args: Array[String]) = {
-    if (args.length != 7 && args.length != 8) {
+    if (args.length != 7 && args.length != 8  && args.length != 9) {
       Console.println("Nankeen")
       Console.println("    spin up a number of loaders that each")
       Console.println("    spin up M writers and have them write N messages to a queue")
       Console.println("    for Z loops")
       Console.println("    spin up O writers to drain the queue")
       Console.println("    (optional true/false) use grabby hands instead of smile for load test.  default is false")
+      Console.println("    (optional true/false) use transactional grabby hand reader default is false")
       Console.println("usage:")
       Console.println("    java -jar nankeen-0.1.jar localhost:22133 test 10 1 1 1 1 true")
       System.exit(1)
@@ -134,8 +149,12 @@ object Nankeen extends LoggingLoadTest {
     val numWriters = args(5).toInt
     val numMessages = args(6).toInt
     var useGrabbyHands = false
-    if ( args.length == 8 ) {
+    if ( args.length > 7 ) {
       useGrabbyHands = args(7).toBoolean
+    }
+	var useGrabbyHandsTransRead = false
+	if ( args.length > 8 ) {
+      useGrabbyHandsTransRead = args(7).toBoolean
     }
 
     val timingsFile = new File("timings.log")
@@ -148,6 +167,7 @@ object Nankeen extends LoggingLoadTest {
         val grabbyConfig = new GrabbyConfig
         grabbyConfig.addServers(Array(hostName))
         grabbyConfig.addQueues(queues.map {i => queueName + i} )
+        grabbyConfig.recvTransactional = useGrabbyHandsTransRead
         Some(new GrabbyHands(grabbyConfig))
       } else {
         None
@@ -183,7 +203,7 @@ object Nankeen extends LoggingLoadTest {
       val loaderThreads = queues.map (i => {
         val (readers, writers) = grabbyHands match {
           case Some(grabby) => {
-            val readers = (1 to numReaders).map(i => new GrabbyReader(grabby, queueName + i, messagesSet)).toList
+            val readers = (1 to numReaders).map(i => if (useGrabbyHandsTransRead) { new GrabbyTransactionalReader(grabby, queueName + i, messagesSet)).toList } else { new GrabbyReader(grabby, queueName + i, messagesSet)).toList}
             val writers = (1 to numWriters).map(i => new GrabbyWriter(grabby, queueName + i, messagesQueue)).toList
             (readers, writers)
           }
