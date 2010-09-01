@@ -7,6 +7,9 @@ bin
 .manager
 .DS_Store
 *.sw?
+.project
+.classpath
+.scala_dependencies
 project/boot/
 project/plugins/lib_managed/
 project/plugins/src_managed/
