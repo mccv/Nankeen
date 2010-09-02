@@ -50,7 +50,7 @@ class SmileReader(client: MemcacheClient[String], val queueName: String, val exp
 class GrabbyReader(grabbyHands: GrabbyHands, val queueName: String, val expectedMessages: Set[String]) extends Reader{
   val sleeepTime = None
   def get() = {
-    val value = grabbyHands.getRecvQueue(queueName).poll(sleepTime, TimeUnit.SECONDS)
+    val value = grabbyHands.getRecvQueue(queueName).poll(10, TimeUnit.SECONDS)
     if ( value != null ) {
       val msg = new String(value.array)
       expectedMessages.synchronized {
@@ -63,13 +63,13 @@ class GrabbyReader(grabbyHands: GrabbyHands, val queueName: String, val expected
 class GrabbyTransactionalReader(grabbyHands: GrabbyHands, val queueName: String, val expectedMessages: Set[String]) extends Reader{
   val sleeepTime = None
   def get() = {
-    val value = grabbyHands.getRecvTransQueue(queueName).poll(sleepTime, TimeUnit.SECONDS)
+    val value = grabbyHands.getRecvTransQueue(queueName).poll(10, TimeUnit.SECONDS)
     if ( value != null ) {
       val msg = new String(value.message.array)
       expectedMessages.synchronized {
         expectedMessages - msg
       }
-	  value.close
+      value.close(true)
     }
   }
 }
@@ -154,7 +154,7 @@ object Nankeen extends LoggingLoadTest {
     }
 	var useGrabbyHandsTransRead = false
 	if ( args.length > 8 ) {
-      useGrabbyHandsTransRead = args(7).toBoolean
+      useGrabbyHandsTransRead = args(8).toBoolean
     }
 
     val timingsFile = new File("timings.log")
@@ -166,8 +166,11 @@ object Nankeen extends LoggingLoadTest {
       if (useGrabbyHands) {
         val grabbyConfig = new GrabbyConfig
         grabbyConfig.addServers(Array(hostName))
-        grabbyConfig.addQueues(queues.map {i => queueName + i} )
+        grabbyConfig.recvNumConnections = numReaders
+        grabbyConfig.sendNumConnections = numWriters
         grabbyConfig.recvTransactional = useGrabbyHandsTransRead
+        grabbyConfig.kestrelReadTimeoutMs = 100
+        grabbyConfig.addQueues(queues.map {i => queueName + i} )
         Some(new GrabbyHands(grabbyConfig))
       } else {
         None
@@ -203,13 +206,15 @@ object Nankeen extends LoggingLoadTest {
       val loaderThreads = queues.map (i => {
         val (readers, writers) = grabbyHands match {
           case Some(grabby) => {
-            val readers = (1 to numReaders).map(i => if (useGrabbyHandsTransRead) { new GrabbyTransactionalReader(grabby, queueName + i, messagesSet)).toList } else { new GrabbyReader(grabby, queueName + i, messagesSet)).toList}
-            val writers = (1 to numWriters).map(i => new GrabbyWriter(grabby, queueName + i, messagesQueue)).toList
+            val readers = (1 to numReaders).map(j => if (useGrabbyHandsTransRead)
+                                                  { new GrabbyTransactionalReader(grabby, queueName+i, messagesSet)
+                                                  } else { new GrabbyReader(grabby, queueName+i, messagesSet) } ).toList
+            val writers = (1 to numWriters).map(j => new GrabbyWriter(grabby, queueName+i, messagesQueue)).toList
             (readers, writers)
           }
           case None => {
-            val readers = (1 to numReaders).map(i => new SmileReader(memcacheClient.get, queueName + i, messagesSet)).toList
-            val writers = (1 to numWriters).map(i => new SmileWriter(memcacheClient.get, queueName + i, messagesQueue)).toList
+            val readers = (1 to numReaders).map(i => new SmileReader(memcacheClient.get, queueName+i, messagesSet)).toList
+            val writers = (1 to numWriters).map(i => new SmileWriter(memcacheClient.get, queueName+i, messagesQueue)).toList
             (readers, writers)
           }
         }
