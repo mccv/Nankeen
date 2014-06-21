@@ -23,7 +23,6 @@ trait Reader extends Runnable{
     try {
       while (expectedMessages.size > 0) {
         get()
-        sleepTime.foreach(Thread.sleep(_))
       }
     } catch {
       case e => {
@@ -44,6 +43,7 @@ class SmileReader(client: MemcacheClient[String], val queueName: String, val exp
       }
       case None => //noop
     }
+    sleepTime.foreach(Thread.sleep(_))
   }
 }
 
@@ -56,6 +56,20 @@ class GrabbyReader(grabbyHands: GrabbyHands, val queueName: String, val expected
       expectedMessages.synchronized {
         expectedMessages - msg
       }
+    }
+  }
+}
+
+class GrabbyTransactionalReader(grabbyHands: GrabbyHands, val queueName: String, val expectedMessages: Set[String]) extends Reader{
+  val sleeepTime = None
+  def get() = {
+    val value = grabbyHands.getRecvTransQueue(queueName).poll(10, TimeUnit.SECONDS)
+    if ( value != null ) {
+      val msg = new String(value.message.array)
+      expectedMessages.synchronized {
+        expectedMessages - msg
+      }
+      value.close(true)
     }
   }
 }
@@ -114,13 +128,14 @@ object Nankeen extends LoggingLoadTest {
   val messagePrefix = "Nankeen Load Test Message "
   val log = Logger.get("nankeen")
   def main(args: Array[String]) = {
-    if (args.length != 7 && args.length != 8) {
+    if (args.length != 7 && args.length != 8  && args.length != 9) {
       Console.println("Nankeen")
       Console.println("    spin up a number of loaders that each")
       Console.println("    spin up M writers and have them write N messages to a queue")
       Console.println("    for Z loops")
       Console.println("    spin up O writers to drain the queue")
       Console.println("    (optional true/false) use grabby hands instead of smile for load test.  default is false")
+      Console.println("    (optional true/false) use transactional grabby hand reader default is false")
       Console.println("usage:")
       Console.println("    java -jar nankeen-0.1.jar localhost:22133 test 10 1 1 1 1 true")
       System.exit(1)
@@ -134,8 +149,12 @@ object Nankeen extends LoggingLoadTest {
     val numWriters = args(5).toInt
     val numMessages = args(6).toInt
     var useGrabbyHands = false
-    if ( args.length == 8 ) {
+    if ( args.length > 7 ) {
       useGrabbyHands = args(7).toBoolean
+    }
+	var useGrabbyHandsTransRead = false
+	if ( args.length > 8 ) {
+      useGrabbyHandsTransRead = args(8).toBoolean
     }
 
     val timingsFile = new File("timings.log")
@@ -147,6 +166,10 @@ object Nankeen extends LoggingLoadTest {
       if (useGrabbyHands) {
         val grabbyConfig = new GrabbyConfig
         grabbyConfig.addServers(Array(hostName))
+        grabbyConfig.recvNumConnections = numReaders
+        grabbyConfig.sendNumConnections = numWriters
+        grabbyConfig.recvTransactional = useGrabbyHandsTransRead
+        grabbyConfig.kestrelReadTimeoutMs = 100
         grabbyConfig.addQueues(queues.map {i => queueName + i} )
         Some(new GrabbyHands(grabbyConfig))
       } else {
@@ -183,13 +206,15 @@ object Nankeen extends LoggingLoadTest {
       val loaderThreads = queues.map (i => {
         val (readers, writers) = grabbyHands match {
           case Some(grabby) => {
-            val readers = (1 to numReaders).map(i => new GrabbyReader(grabby, queueName + i, messagesSet)).toList
-            val writers = (1 to numWriters).map(i => new GrabbyWriter(grabby, queueName + i, messagesQueue)).toList
+            val readers = (1 to numReaders).map(j => if (useGrabbyHandsTransRead)
+                                                  { new GrabbyTransactionalReader(grabby, queueName+i, messagesSet)
+                                                  } else { new GrabbyReader(grabby, queueName+i, messagesSet) } ).toList
+            val writers = (1 to numWriters).map(j => new GrabbyWriter(grabby, queueName+i, messagesQueue)).toList
             (readers, writers)
           }
           case None => {
-            val readers = (1 to numReaders).map(i => new SmileReader(memcacheClient.get, queueName + i, messagesSet)).toList
-            val writers = (1 to numWriters).map(i => new SmileWriter(memcacheClient.get, queueName + i, messagesQueue)).toList
+            val readers = (1 to numReaders).map(i => new SmileReader(memcacheClient.get, queueName+i, messagesSet)).toList
+            val writers = (1 to numWriters).map(i => new SmileWriter(memcacheClient.get, queueName+i, messagesQueue)).toList
             (readers, writers)
           }
         }
